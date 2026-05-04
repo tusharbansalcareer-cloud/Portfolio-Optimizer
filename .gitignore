@@ -4,3 +4,7 @@ __pycache__/
 .deps/
 .tmp/
 .streamlit/
+.codex/
+.vscode/
+*.log
+*.env
