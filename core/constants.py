@@ -40,7 +40,9 @@ STRATEGY_ALIASES = {
 REBALANCE_WEEKLY = "Weekly"
 REBALANCE_MONTHLY = "Monthly"
 REBALANCE_QUARTERLY = "Quarterly"
+REBALANCE_NONE = "None"
 SUPPORTED_REBALANCE_FREQUENCIES = (
+    REBALANCE_NONE,
     REBALANCE_WEEKLY,
     REBALANCE_MONTHLY,
     REBALANCE_QUARTERLY,
@@ -120,4 +122,3 @@ NAME_TO_YAHOO_TICKER = {
 for yahoo_ticker in tuple(NAME_TO_YAHOO_TICKER.values()):
     if yahoo_ticker.endswith(".NS"):
         NAME_TO_YAHOO_TICKER.setdefault(yahoo_ticker.removesuffix(".NS").lower(), yahoo_ticker)
-

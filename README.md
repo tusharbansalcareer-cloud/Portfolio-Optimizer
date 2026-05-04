@@ -15,7 +15,7 @@ The app is built for a practical investing workflow: choose stocks, optimize a p
 - Runs an alpha and information-ratio gate before showing Monte Carlo risk output for the selected portfolio.
 - Shows portfolio allocation, risk contribution, annual returns, cumulative returns, worst drawdown periods, and correlation matrix.
 - Runs Monte Carlo simulations for a selected time horizon and initial capital.
-- Runs walk-forward backtests that retrain the strategy at every rebalance using only trailing historical data.
+- Runs static optimized-weight backtests or walk-forward backtests that retrain at every rebalance using only trailing historical data.
 - Applies transaction costs and slippage during backtests.
 - Tracks optimizer fallback events and exposes optional debug diagnostics.
 
@@ -89,9 +89,11 @@ This makes it easier to see whether a high-return strategy is taking concentrati
 
 ### 3. Backtesting
 
-This tab tests strategy rules historically using a walk-forward process.
+This tab can test the latest optimized allocation as a static hold, or test strategy rules historically using a walk-forward process.
 
-The app does not reuse today's optimized weights throughout history. Instead, for each rebalance date, it:
+When rebalance frequency is `None`, the app holds the supplied optimized or manual weights through the full selected backtest period and applies entry transaction cost once.
+
+For Weekly, Monthly, and Quarterly frequencies, the app does not reuse today's optimized weights throughout history. Instead, for each rebalance date, it:
 
 1. Looks backward using the selected trailing lookback window.
 2. Optimizes using only data available before that rebalance date.
@@ -101,6 +103,7 @@ The app does not reuse today's optimized weights throughout history. Instead, fo
 
 Supported rebalance frequencies:
 
+- None
 - Weekly
 - Monthly
 - Quarterly
@@ -315,7 +318,8 @@ result = run_walk_forward_backtest(
 - The app uses daily simple returns for portfolio aggregation.
 - Yahoo Finance data availability can vary by ticker and date range.
 - A long lookback window requires enough historical data before the first out-of-sample period can be created.
+- None-frequency backtests are static-hold simulations using supplied weights, not walk-forward validations.
 - Walk-forward backtests intentionally avoid look-ahead bias by training only on data before each rebalance date.
-- Custom manual backtests re-apply the entered static allocation at each rebalance.
+- Custom manual backtests hold the entered static allocation for None frequency or re-apply it at each walk-forward rebalance.
 - Optimizer fallback events are surfaced instead of silently hidden.
 - Historical performance, optimized weights, and simulated results are decision-support outputs, not financial advice.

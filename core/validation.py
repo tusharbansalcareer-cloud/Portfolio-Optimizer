@@ -108,7 +108,10 @@ def validate_rebalance_frequency(rebalance_frequency: str) -> str:
 
 def rebalance_period_alias(rebalance_frequency: str) -> str:
     """Return the pandas period alias for a validated rebalance frequency."""
-    return REBALANCE_PERIOD_ALIASES[validate_rebalance_frequency(rebalance_frequency)]
+    frequency = validate_rebalance_frequency(rebalance_frequency)
+    if frequency not in REBALANCE_PERIOD_ALIASES:
+        raise PortfolioError(f"Rebalance frequency '{frequency}' does not use a calendar period alias.")
+    return REBALANCE_PERIOD_ALIASES[frequency]
 
 
 def validate_weight_bounds(n_assets: int, max_weight: float) -> None:
@@ -250,4 +253,3 @@ def _normalize_lookup_key(value: str) -> str:
     key = re.sub(r"[^a-z0-9]+", " ", key)
     key = re.sub(r"\b(limited|ltd|company|co|stock|shares|share)\b", " ", key)
     return re.sub(r"\s+", " ", key).strip()
-

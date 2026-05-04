@@ -17,6 +17,8 @@ from core.constants import (
     DEFAULT_SLIPPAGE,
     DEFAULT_TRANSACTION_COST,
     OPTIMIZATION_STRATEGIES,
+    REBALANCE_MONTHLY,
+    REBALANCE_NONE,
     STRATEGY_CUSTOM_MANUAL,
     SUPPORTED_REBALANCE_FREQUENCIES,
 )
@@ -58,8 +60,8 @@ TAB_DESCRIPTIONS = {
         "on the same cleaned return history."
     ),
     "Backtesting": (
-        "Run a walk-forward validation that retrains at each rebalance using only trailing historical data, "
-        "then compares realized out-of-sample performance against benchmark and strategy baselines."
+        "Run a static hold of the latest optimized weights or a walk-forward validation that retrains at each rebalance, "
+        "then compare realized performance against benchmark and strategy baselines."
     ),
 }
 
@@ -81,8 +83,8 @@ UI_HELP = {
     "initial_portfolio": f"Starting investment amount. Unit: portfolio currency. Default: {int(DEFAULT_INITIAL_CAPITAL)}.",
     "enable_custom_weights": "Manually assign portfolio weights instead of optimization. Unit: on/off. Default: off.",
     "normalize_weights": "Ensure weights sum to 100%. Unit: on/off. Default: on.",
-    "rebalance_frequency": "How often the walk-forward backtest re-optimizes. Unit: calendar frequency. Default: Monthly.",
-    "lookback_window": f"Trailing training window used before each rebalance. Unit: trading days. Default: {DEFAULT_LOOKBACK_DAYS}.",
+    "rebalance_frequency": "How often the backtest re-optimizes. None holds supplied weights through the full test. Unit: frequency. Default: Monthly.",
+    "lookback_window": f"Trailing training window used before each rebalance. Ignored for None. Unit: trading days. Default: {DEFAULT_LOOKBACK_DAYS}.",
     "transaction_cost": f"Per-turnover transaction cost applied at rebalance. Unit: percent. Default: {DEFAULT_TRANSACTION_COST * 100:.2f}%.",
     "slippage": f"Estimated execution slippage applied at rebalance. Unit: basis points. Default: {DEFAULT_SLIPPAGE * 10000:.0f} bps.",
     "comparison_mode": "Include benchmark, equal-weight basket, and all optimizer strategies in the backtest comparison. Unit: on/off. Default: on.",
@@ -113,6 +115,14 @@ def manual_weights_template(tickers: list[str]) -> pd.DataFrame:
     return pd.DataFrame({"Ticker": tickers, "Custom Weight %": [weight] * len(tickers)})
 
 
+def weights_display_frame(weights: pd.Series) -> pd.DataFrame:
+    display = weights.rename("Weight").reset_index()
+    display = display.rename(columns={display.columns[0]: "Ticker"})
+    display = display.sort_values("Weight", ascending=False)
+    display["Weight"] = display["Weight"].map(pct)
+    return display
+
+
 def date_range_label(index: pd.Index) -> str:
     if len(index) == 0:
         return ""
@@ -132,6 +142,8 @@ def backtest_prefill_defaults() -> dict[str, object]:
         "strategy": OPTIMIZATION_STRATEGIES[0],
         "risk_free_rate": DEFAULT_RISK_FREE_RATE,
         "max_weight": DEFAULT_MAX_WEIGHT,
+        "rebalance_frequency": REBALANCE_MONTHLY,
+        "static_weights": None,
         "prefilled": False,
     }
     result = st.session_state.get("portfolio_result")
@@ -149,6 +161,8 @@ def backtest_prefill_defaults() -> dict[str, object]:
             "strategy": strategy,
             "risk_free_rate": float(getattr(result, "risk_free_rate", DEFAULT_RISK_FREE_RATE)),
             "max_weight": float(getattr(result, "max_weight", DEFAULT_MAX_WEIGHT)),
+            "rebalance_frequency": REBALANCE_NONE,
+            "static_weights": result.selected_result.weights.copy(),
             "prefilled": True,
         }
     )
@@ -860,18 +874,16 @@ with comparison_tab:
         st.info("Run the portfolio pipeline first to compare strategies.")
 
 with backtesting_tab:
-    st.subheader("Walk-Forward Backtesting")
+    st.subheader("Portfolio Backtesting")
     st.caption(TAB_DESCRIPTIONS["Backtesting"])
     st.caption(
-        "Data start date is the earliest data available for training. "
-        "The first realized backtest period starts only after the selected lookback window. "
-        "Example: start 2017-01-01, lookback 1260, monthly rebalance -> first out-of-sample period around 2022-01."
+        "Use None to hold supplied weights through the full test period. "
+        "Weekly, Monthly, and Quarterly use walk-forward training, where the first realized period starts only after the selected lookback window."
     )
     bt_defaults = backtest_prefill_defaults()
     if bt_defaults["prefilled"]:
         st.caption(
-            "Defaults are prefilled from the latest optimizer result; historical periods still re-optimize from trailing data "
-            "instead of reusing final optimized weights."
+            "Defaults are prefilled from the latest optimizer result; None will hold those optimized weights until the end of the backtest."
         )
     with st.form("backtesting_form"):
         st.markdown("**Data Inputs**")
@@ -910,7 +922,7 @@ with backtesting_tab:
         with bt_custom_cols[0]:
             bt_enable_custom = st.checkbox(
                 "Enable custom manual weights",
-                value=bt_defaults["strategy"] == STRATEGY_CUSTOM_MANUAL,
+                value=False,
                 help=UI_HELP["enable_custom_weights"],
             )
         with bt_custom_cols[1]:
@@ -930,7 +942,7 @@ with backtesting_tab:
         if bt_enable_custom:
             try:
                 bt_preview_tickers = normalize_tickers(bt_tickers)
-                st.caption("Backtest custom weights are percentages and are re-applied at every rebalance date.")
+                st.caption("Backtest custom weights are percentages.")
                 bt_custom_df = st.data_editor(
                     manual_weights_template(bt_preview_tickers),
                     key=f"backtest_custom_weights_{abs(hash(tuple(bt_preview_tickers))) % 1000000}",
@@ -944,7 +956,7 @@ with backtesting_tab:
                         ),
                         "Custom Weight %": st.column_config.NumberColumn(
                             "Custom Weight %",
-                            help="Static allocation rebalanced through the walk-forward test. Unit: percent of portfolio.",
+                            help="Manual allocation for the backtest. Unit: percent of portfolio.",
                             min_value=0.0,
                             max_value=100.0,
                             step=0.1,
@@ -952,12 +964,12 @@ with backtesting_tab:
                     },
                 )
                 if bt_defaults["strategy"] == STRATEGY_CUSTOM_MANUAL:
-                    st.caption("Custom manual backtests use the weights entered here; optimizer-result weights are not copied forward.")
+                    st.caption("Custom manual backtests use the weights entered here when custom weights are enabled.")
             except PortfolioError as exc:
                 st.warning(f"Custom weight editor is waiting for valid backtest tickers: {exc}")
 
         bt_strategy_options = list(OPTIMIZATION_STRATEGIES)
-        if bt_enable_custom:
+        if bt_enable_custom or bt_defaults["strategy"] == STRATEGY_CUSTOM_MANUAL:
             bt_strategy_options.append(STRATEGY_CUSTOM_MANUAL)
 
         setting_cols = st.columns(4)
@@ -972,10 +984,14 @@ with backtesting_tab:
                 help=UI_HELP["strategy"],
             )
         with setting_cols[1]:
+            bt_rebalance_options = list(SUPPORTED_REBALANCE_FREQUENCIES)
+            bt_rebalance_default = str(bt_defaults["rebalance_frequency"])
+            if bt_rebalance_default not in bt_rebalance_options:
+                bt_rebalance_default = REBALANCE_MONTHLY
             bt_rebalance = st.selectbox(
                 "Rebalance frequency",
-                options=list(SUPPORTED_REBALANCE_FREQUENCIES),
-                index=1,
+                options=bt_rebalance_options,
+                index=bt_rebalance_options.index(bt_rebalance_default),
                 help=UI_HELP["rebalance_frequency"],
             )
         with setting_cols[2]:
@@ -1006,18 +1022,37 @@ with backtesting_tab:
             help=UI_HELP["risk_free_rate"],
         )
 
-        required_price_rows = int(bt_lookback) + 2
+        bt_static_weights = bt_defaults.get("static_weights")
+        if bt_rebalance == REBALANCE_NONE:
+            if not bt_enable_custom and isinstance(bt_static_weights, pd.Series):
+                st.markdown("**Static Optimized Allocation**")
+                st.dataframe(weights_display_frame(bt_static_weights), hide_index=True, use_container_width=True)
+            elif not bt_enable_custom:
+                st.warning("Run the portfolio pipeline first or enable custom manual weights to use None.")
+            if bt_comparison_mode:
+                st.caption("With None, comparison mode uses only Benchmark and Equal Weight Basket.")
+
+        required_price_rows = 3 if bt_rebalance == REBALANCE_NONE else int(bt_lookback) + 2
         available_business_days = estimated_business_days(bt_start, bt_end)
         if available_business_days < required_price_rows:
-            st.warning(
-                f"The selected dates contain roughly {available_business_days} business days, "
-                f"but {LOOKBACK_LABELS[int(bt_lookback)]} needs at least {required_price_rows} price rows. "
-                "Move the start date earlier or choose a shorter lookback."
+            if bt_rebalance == REBALANCE_NONE:
+                st.warning(
+                    f"The selected dates contain roughly {available_business_days} business days, "
+                    f"but None needs at least {required_price_rows} price rows."
+                )
+            else:
+                st.warning(
+                    f"The selected dates contain roughly {available_business_days} business days, "
+                    f"but {LOOKBACK_LABELS[int(bt_lookback)]} needs at least {required_price_rows} price rows. "
+                    "Move the start date earlier or choose a shorter lookback."
+                )
+        if bt_rebalance == REBALANCE_NONE:
+            st.caption("None holds supplied weights over the full selected period and ignores the lookback window.")
+        else:
+            st.caption(
+                f"Selected lookback requires at least {required_price_rows} usable price rows for every ticker "
+                "before the first out-of-sample period can be created."
             )
-        st.caption(
-            f"Selected lookback requires at least {required_price_rows} usable price rows for every ticker "
-            "before the first out-of-sample period can be created."
-        )
 
         st.markdown("**Capital**")
         bt_capital = st.number_input(
@@ -1060,19 +1095,23 @@ with backtesting_tab:
             "Run Backtest",
             type="primary",
             use_container_width=True,
-            help="Run the full walk-forward backtest and render performance, turnover, fallback, and debug output.",
+            help="Run the selected static-hold or walk-forward backtest and render performance, turnover, fallback, and debug output.",
         )
 
     if run_backtest:
         progress = st.progress(0)
         status = st.status("Starting backtest...", expanded=True)
         try:
+            static_weights_for_backtest = None
+            if bt_rebalance == REBALANCE_NONE and not bt_enable_custom and isinstance(bt_static_weights, pd.Series):
+                static_weights_for_backtest = bt_static_weights
+            run_strategy = STRATEGY_CUSTOM_MANUAL if bt_rebalance == REBALANCE_NONE and bt_enable_custom else bt_strategy
             stages = [
                 "1. Validating inputs",
                 "2. Loading historical price data",
                 "3. Cleaning and aligning data",
                 "4. Calculating returns",
-                "5. Running walk-forward optimization",
+                "5. Applying static weights" if bt_rebalance == REBALANCE_NONE else "5. Running walk-forward optimization",
                 "6. Applying transaction costs",
                 "7. Calculating benchmark returns",
                 "8. Calculating metrics",
@@ -1086,7 +1125,7 @@ with backtesting_tab:
                 benchmark=bt_benchmark,
                 start=bt_start.isoformat(),
                 end=bt_end.isoformat(),
-                strategy=bt_strategy,
+                strategy=run_strategy,
                 rebalance_frequency=bt_rebalance,
                 lookback_days=int(bt_lookback),
                 initial_capital=float(bt_capital),
@@ -1096,6 +1135,7 @@ with backtesting_tab:
                 max_weight=float(bt_max_weight),
                 custom_weights_df=bt_custom_df if bt_enable_custom else None,
                 normalize_custom_weights=bt_normalize_custom,
+                static_weights=static_weights_for_backtest,
                 comparison_mode=bt_comparison_mode,
                 debug=bt_debug,
             )
@@ -1108,14 +1148,20 @@ with backtesting_tab:
             status.update(label="Backtest complete.", state="complete", expanded=False)
         except PortfolioError as exc:
             st.session_state.pop("backtest_result", None)
-            status.write("Backtest stopped before optimization because the available price history is shorter than the selected inputs require.")
+            status.write("Backtest stopped while validating inputs or data.")
             status.update(label="Backtest stopped.", state="error", expanded=True)
             st.error(str(exc))
-            st.info(
-                f"For {LOOKBACK_LABELS[int(bt_lookback)]}, the loader needs at least {int(bt_lookback) + 2} usable price rows "
-                "for every selected ticker. Move the backtest start date earlier, choose a shorter lookback, "
-                "or remove tickers with shorter Yahoo Finance history."
-            )
+            if bt_rebalance == REBALANCE_NONE:
+                st.info(
+                    "For None, the backtest needs static weights that exactly match the selected tickers. "
+                    "Run the portfolio pipeline first, keep the prefilled ticker list, or enable custom manual weights."
+                )
+            else:
+                st.info(
+                    f"For {LOOKBACK_LABELS[int(bt_lookback)]}, the loader needs at least {int(bt_lookback) + 2} usable price rows "
+                    "for every selected ticker. Move the backtest start date earlier, choose a shorter lookback, "
+                    "or remove tickers with shorter Yahoo Finance history."
+                )
         except Exception:
             status.update(label="Backtest failed.", state="error", expanded=True)
             raise
@@ -1125,4 +1171,4 @@ with backtesting_tab:
         if st.session_state.get("backtest_debug_enabled", False):
             display_debug(st.session_state["backtest_result"].debug_info)
     else:
-        st.info("Set the backtest inputs, then run the walk-forward test.")
+        st.info("Set the backtest inputs, then run the backtest.")

@@ -15,6 +15,7 @@ from core.constants import (
     DEFAULT_SLIPPAGE,
     DEFAULT_TRANSACTION_COST,
     OPTIMIZATION_STRATEGIES,
+    REBALANCE_NONE,
     STRATEGY_CUSTOM_MANUAL,
     STRATEGY_EQUAL_WEIGHT,
 )
@@ -38,6 +39,7 @@ from core.validation import (
     normalize_strategy_name,
     normalize_ticker,
     normalize_tickers,
+    check_weights_sum_to_one,
     validate_custom_weights,
     validate_date_range,
     validate_lookback_period,
@@ -49,7 +51,7 @@ from core.optimizer import OptimizationResult, PortfolioOptimizer
 
 @dataclass(frozen=True)
 class BacktestResult:
-    """Streamlit-ready output from a walk-forward backtest."""
+    """Streamlit-ready output from a static-hold or walk-forward backtest."""
 
     strategy: str
     tickers: list[str]
@@ -164,7 +166,7 @@ class BacktestOptimizer:
 
 
 class WalkForwardBacktester:
-    """Runs strict walk-forward backtesting with no look-ahead bias."""
+    """Runs static-hold or strict walk-forward backtesting with no look-ahead bias."""
 
     def __init__(
         self,
@@ -192,22 +194,37 @@ class WalkForwardBacktester:
         risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
         max_weight: float = DEFAULT_MAX_WEIGHT,
         custom_weights: pd.Series | None = None,
+        static_weights: pd.Series | dict[str, float] | None = None,
         comparison_mode: bool = False,
         debug_info: dict[str, object] | None = None,
     ) -> BacktestResult:
         """Run the selected strategy and optional comparison strategies on aligned returns."""
         strategy = normalize_strategy_name(strategy)
-        validate_lookback_period(self.lookback_days, len(asset_returns))
-        validate_weight_bounds(asset_returns.shape[1], max_weight)
         debug_info = debug_info or _empty_debug_info()
+        is_static_hold = self.rebalance_frequency == REBALANCE_NONE
 
-        main = self._run_single_strategy(
-            strategy,
-            asset_returns,
-            risk_free_rate=risk_free_rate,
-            max_weight=max_weight,
-            custom_weights=custom_weights,
-        )
+        if is_static_hold:
+            hold_weights = custom_weights if custom_weights is not None else static_weights
+            if hold_weights is None:
+                raise PortfolioError(
+                    "Rebalance frequency 'None' needs weights to hold. Run the portfolio pipeline first "
+                    "or enable custom manual weights in the Backtesting tab."
+                )
+            main = self._run_static_strategy(strategy, asset_returns, hold_weights)
+            if comparison_mode:
+                debug_info["warnings"].append(
+                    "Comparison mode with rebalance frequency 'None' compares only Benchmark and Equal Weight Basket."
+                )
+        else:
+            validate_lookback_period(self.lookback_days, len(asset_returns))
+            validate_weight_bounds(asset_returns.shape[1], max_weight)
+            main = self._run_single_strategy(
+                strategy,
+                asset_returns,
+                risk_free_rate=risk_free_rate,
+                max_weight=max_weight,
+                custom_weights=custom_weights,
+            )
 
         comparison_series = {
             strategy: main.net_returns,
@@ -215,7 +232,7 @@ class WalkForwardBacktester:
             "Equal Weight Basket": self._equal_weight_basket_returns(asset_returns),
         }
 
-        if comparison_mode:
+        if comparison_mode and not is_static_hold:
             for candidate in OPTIMIZATION_STRATEGIES:
                 candidate = normalize_strategy_name(candidate)
                 if candidate == strategy:
@@ -260,6 +277,77 @@ class WalkForwardBacktester:
             debug_info=debug_info,
         )
         return report.build()
+
+    def _run_static_strategy(
+        self,
+        strategy: str,
+        asset_returns: pd.DataFrame,
+        static_weights: pd.Series | dict[str, float],
+    ) -> SingleStrategyBacktest:
+        """Apply supplied weights once and hold them through the full backtest period."""
+        weights = _validate_static_weights(static_weights, list(asset_returns.columns))
+        first_date = pd.Timestamp(asset_returns.index[0])
+        turnover = self.transaction_cost_model.calculate_turnover(
+            weights,
+            pd.Series(0.0, index=asset_returns.columns, dtype=float),
+        )
+        costs = self.transaction_cost_model.cost_breakdown(turnover)
+
+        gross = asset_returns.mul(weights, axis=1).sum(axis=1).rename(strategy)
+        net = self.transaction_cost_model.apply_rebalance_cost(gross, costs["total_cost"])
+        net.name = strategy
+
+        weight_row = {"Date": first_date}
+        weight_row.update({ticker: float(weights.get(ticker, 0.0)) for ticker in asset_returns.columns})
+        rebalance_row = {
+            "Date": first_date,
+            "Training Start": pd.NaT,
+            "Training End": pd.NaT,
+            "Observations": int(len(asset_returns)),
+            "Optimizer": "Static optimized weights",
+            "Optimizer Success": True,
+            "Fallback Used": False,
+            "Message": "Rebalance frequency None: supplied weights were held through the full backtest period.",
+        }
+        cost_row = {
+            "Date": first_date,
+            "Turnover": costs["turnover"],
+            "Transaction Cost": costs["transaction_cost"],
+            "Slippage Cost": costs["slippage_cost"],
+            "Total Cost": costs["total_cost"],
+        }
+        rebalance_log = {
+            "date": first_date.date().isoformat(),
+            "mode": "static_hold",
+            "training_window_start": None,
+            "training_window_end": None,
+            "training_observations": 0,
+            "optimizer_success": True,
+            "fallback_used": False,
+            "optimizer_message": "Supplied static weights held without walk-forward re-optimization.",
+            "weights": {ticker: float(value) for ticker, value in weights.items()},
+        }
+        cost_log = {
+            "date": first_date.date().isoformat(),
+            "previous_weights": {ticker: 0.0 for ticker in asset_returns.columns},
+            "new_weights": {ticker: float(weights.get(ticker, 0.0)) for ticker in asset_returns.columns},
+            "turnover": costs["turnover"],
+            "transaction_cost": costs["transaction_cost"],
+            "slippage_cost": costs["slippage_cost"],
+            "net_cost_applied": costs["total_cost"],
+        }
+
+        return SingleStrategyBacktest(
+            strategy=strategy,
+            net_returns=net,
+            gross_returns=gross,
+            weights_history=pd.DataFrame([weight_row]).set_index("Date").sort_index(),
+            rebalance_table=pd.DataFrame([rebalance_row]),
+            cost_table=pd.DataFrame([cost_row]),
+            rebalance_logs=[rebalance_log],
+            cost_logs=[cost_log],
+            fallback_dates=[],
+        )
 
     def _run_single_strategy(
         self,
@@ -512,16 +600,19 @@ def run_walk_forward_backtest(
     max_weight: float = DEFAULT_MAX_WEIGHT,
     custom_weights_df: pd.DataFrame | None = None,
     normalize_custom_weights: bool = True,
+    static_weights: pd.Series | dict[str, float] | None = None,
     comparison_mode: bool = False,
     debug: bool = False,
 ) -> BacktestResult:
-    """Convenience API used by Streamlit to run a complete walk-forward backtest."""
+    """Convenience API used by Streamlit to run a complete backtest."""
     start_ts, end_ts = validate_date_range(start, end)
     resolved_tickers = normalize_tickers(tickers)
     benchmark_ticker = normalize_ticker(benchmark)
     strategy = normalize_strategy_name(strategy)
-    validate_rebalance_frequency(rebalance_frequency)
-    validate_weight_bounds(len(resolved_tickers), max_weight)
+    rebalance_frequency = validate_rebalance_frequency(rebalance_frequency)
+    is_static_hold = rebalance_frequency == REBALANCE_NONE
+    if not is_static_hold:
+        validate_weight_bounds(len(resolved_tickers), max_weight)
     resolution = describe_ticker_resolution(tickers, resolved_tickers)
 
     debug_info = _empty_debug_info()
@@ -540,8 +631,10 @@ def run_walk_forward_backtest(
         "debug_enabled": bool(debug),
     }
 
-    prices = fetch_prices(resolved_tickers, start_ts.date().isoformat(), end_ts.date().isoformat(), min_rows=lookback_days + 2)
-    benchmark_prices = fetch_prices([benchmark_ticker], start_ts.date().isoformat(), end_ts.date().isoformat(), min_rows=60)
+    asset_min_rows = 3 if is_static_hold else lookback_days + 2
+    prices = fetch_prices(resolved_tickers, start_ts.date().isoformat(), end_ts.date().isoformat(), min_rows=asset_min_rows)
+    benchmark_min_rows = 3 if is_static_hold else 60
+    benchmark_prices = fetch_prices([benchmark_ticker], start_ts.date().isoformat(), end_ts.date().isoformat(), min_rows=benchmark_min_rows)
     debug_info["data_quality"] = {
         "assets": data_quality_summary(prices, resolved_tickers),
         "benchmark": data_quality_summary(benchmark_prices, [benchmark_ticker]),
@@ -560,8 +653,14 @@ def run_walk_forward_backtest(
     custom_weights = None
     if custom_weights_df is not None and not custom_weights_df.empty:
         custom_weights = validate_custom_weights(custom_weights_df, resolved_tickers, normalize=normalize_custom_weights)
-    elif strategy == STRATEGY_CUSTOM_MANUAL:
+    elif strategy == STRATEGY_CUSTOM_MANUAL and not is_static_hold:
         raise PortfolioError("Custom Manual Allocation requires custom weights.")
+
+    if is_static_hold and static_weights is None and custom_weights is None:
+        raise PortfolioError(
+            "Rebalance frequency 'None' needs weights to hold. Run the portfolio pipeline first "
+            "or enable custom manual weights in the Backtesting tab."
+        )
 
     cost_model = TransactionCostModel(transaction_cost=transaction_cost, slippage=slippage)
     backtester = WalkForwardBacktester(
@@ -580,6 +679,7 @@ def run_walk_forward_backtest(
         risk_free_rate=risk_free_rate,
         max_weight=max_weight,
         custom_weights=custom_weights,
+        static_weights=static_weights,
         comparison_mode=comparison_mode,
         debug_info=debug_info,
     )
@@ -595,6 +695,26 @@ def _empty_debug_info() -> dict[str, object]:
         "metric_checks": {},
         "warnings": [],
     }
+
+
+def _validate_static_weights(static_weights: pd.Series | dict[str, float], tickers: list[str]) -> pd.Series:
+    weights = pd.Series(static_weights, dtype=float)
+    weights.index = weights.index.astype(str)
+    missing = [ticker for ticker in tickers if ticker not in set(weights.index)]
+    extra = sorted(set(weights.index) - set(tickers))
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("missing " + ", ".join(missing))
+        if extra:
+            parts.append("extra " + ", ".join(extra))
+        raise PortfolioError(
+            "Static optimized weights must exactly match the selected backtest tickers "
+            f"({'; '.join(parts)}). Run the portfolio pipeline again or revert the backtest tickers."
+        )
+    weights = weights.reindex(tickers).astype(float)
+    check_weights_sum_to_one(weights)
+    return weights
 
 
 def _cap_logs(logs: list[dict[str, object]], edge_count: int) -> list[dict[str, object]]:
